@@ -1,9 +1,10 @@
 [package]
-name = "binutils"
+name = "sigmaos_binutils"
 version = "0.1.0"
 edition = "2021"
-description = "SigmaOS SigmaOS-binutils component - Inspired by Arch Linux and Debian"
 license = "MIT"
-repository = "https://github.com/AaryanSinghChauhan09/SigmaOS-binutils"
+description = "SigmaOS binutils component inspired by Linux Mint / Omarchy / Arch Linux."
 
-[dependencies]
+[lib]
+name = "sigmaos_binutils"
+path = "src/lib.rs"
