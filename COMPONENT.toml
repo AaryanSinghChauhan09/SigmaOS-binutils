@@ -3,7 +3,7 @@ name = "SigmaOS-binutils"
 tier = 2
 stability = "scaffold"
 language = "rust"
-description = "binutils component"
+description = "SigmaOS binutils: ar archives, ELF inspection"
 upstream = []
 
 [contract]
