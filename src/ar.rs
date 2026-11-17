@@ -1,176 +1,141 @@
-//! `ar` (archiver) format — static libraries (`.a` files).
+//! `ar` static-archive parser (GNU/BSD variants).
 //!
-//! Layout: `!<arch>\n` magic, then 60-byte headers per member:
-//! name[16] mtime[12] uid[6] gid[6] mode[8] size[10] fmag[2]="`\n",
-//! name terminated by `/\n`, long names (>15) via `//` string table.
+//! Archive layout: 8-byte magic `!<arch>\n`, then a sequence of 60-byte
+//! member headers each followed by `size` bytes of data (padded to even).
 
-use crate::error::BinutilsError;
-use std::collections::BTreeMap;
+use std::fmt;
 
-const MAGIC: &[u8; 8] = b"!<arch>\n";
-const HEADER_LEN: usize = 60;
-const GLOBAL_NAME: &str = "//";
-
-/// Kind of archive member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberKind {
-    /// Regular object member.
-    Object,
-    /// Symbol table (`/` or `/SYM64/`).
-    SymbolTable,
-    /// Long-name string table (`//`).
-    NameTable,
+/// Errors produced while parsing an archive.
+#[derive(Debug)]
+pub enum ArError {
+    /// Input is too short to contain the magic or a member header.
+    Truncated,
+    /// The leading magic bytes are not `!<arch>\n`.
+    BadMagic,
+    /// A numeric header field could not be parsed.
+    BadField(&'static str),
+    /// A member name referenced the string table out of range.
+    BadNameRef,
+    /// A requested member was not present.
+    MemberNotFound(String),
 }
 
-/// One member of an archive.
+impl fmt::Display for ArError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "archive truncated"),
+            Self::BadMagic => write!(f, "not an ar archive (bad magic)"),
+            Self::BadField(field) => write!(f, "bad numeric field: {field}"),
+            Self::BadNameRef => write!(f, "member name reference out of range"),
+            Self::MemberNotFound(n) => write!(f, "member not found: {n}"),
+        }
+    }
+}
+impl std::error::Error for ArError {}
+
+/// A single member of an `ar` archive.
 #[derive(Debug, Clone)]
 pub struct Member {
     pub name: String,
-    pub kind: MemberKind,
     pub data: Vec<u8>,
 }
 
-/// Parsed `ar` archive.
-#[derive(Debug, Default)]
+/// A parsed `ar` archive.
+#[derive(Debug)]
 pub struct Archive {
     pub members: Vec<Member>,
+    string_table: Vec<u8>,
 }
 
-/// Builder producing deterministic archives (sorted members, zeroed metadata).
-#[derive(Debug, Default)]
-pub struct ArchiveBuilder {
-    members: BTreeMap<String, Vec<u8>>,
+const MAGIC: &[u8; 8] = b"!<arch>\n";
+const HDR_LEN: usize = 60;
+
+fn parse_num(field: &[u8], what: &'static str) -> Result<usize, ArError> {
+    let s = std::str::from_utf8(field).map_err(|_| ArError::BadField(what))?;
+    s.trim().parse::<usize>().map_err(|_| ArError::BadField(what))
 }
 
-impl ArchiveBuilder {
-    pub fn new() -> Self { Self::default() }
-
-    /// Add/replace a member; name must be ≤15 bytes or stored via name table.
-    pub fn add(&mut self, name: impl Into<String>, data: Vec<u8>) -> &mut Self {
-        self.members.insert(name.into(), data);
-        self
+/// Resolve a raw member name field to a real name.
+fn resolve_name(raw: &str, string_table: &[u8], data_head: &[u8]) -> Result<String, ArError> {
+    let raw = raw.trim_end_matches(|c| c == ' ' || c == '\0');
+    // BSD-style long name: "#1/<len>" — name is the first <len> bytes of data.
+    if let Some(rest) = raw.strip_prefix("#1/") {
+        if let Ok(len) = rest.trim().parse::<usize>() {
+            return Ok(String::from_utf8_lossy(&data_head[..len.min(data_head.len())]).into_owned());
+        }
+        return Ok(raw.to_string());
     }
-
-    /// Serialise to the `ar` format.
-    pub fn build(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        // Long-name table for names > 15 chars.
-        let mut name_table = Vec::new();
-        let mut offsets: BTreeMap<String, usize> = BTreeMap::new();
-        for name in self.members.keys() {
-            if name.len() > 15 {
-                offsets.insert(name.clone(), name_table.len());
-                name_table.extend_from_slice(name.as_bytes());
-                name_table.push(b'/');
-                name_table.push(b'\n');
+    // String-table reference: "/<offset>" (offset "/" alone is the table itself).
+    if let Some(off_str) = raw.strip_prefix('/') {
+        if off_str.is_empty() {
+            return Ok(String::new()); // the string table member
+        }
+        if let Ok(off) = off_str.trim().parse::<usize>() {
+            let end = string_table[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| off + p)
+                .unwrap_or(string_table.len());
+            if off > string_table.len() || end > string_table.len() {
+                return Err(ArError::BadNameRef);
             }
+            return Ok(String::from_utf8_lossy(&string_table[off..end]).into_owned());
         }
-        if !name_table.is_empty() {
-            write_header(&mut out, GLOBAL_NAME, name_table.len() as u64, 0o100644);
-            out.extend_from_slice(&name_table);
-            pad(&mut out);
-        }
-        for (name, data) in &self.members {
-            let field = if name.len() > 15 {
-                format!("/{}/", offsets[name])
-            } else {
-                format!("{name}/")
-            };
-            write_header(&mut out, &field, data.len() as u64, 0o100644);
-            out.extend_from_slice(data);
-            pad(&mut out);
-        }
-        out
     }
+    // GNU-style: trailing '/' terminator.
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 impl Archive {
-    /// Parse an archive from bytes.
-    pub fn parse(data: &[u8]) -> Result<Self, BinutilsError> {
-        if data.len() < 8 || &data[..8] != MAGIC {
-            return Err(BinutilsError::BadFormat("not an ar archive"));
+    /// Parse an `ar` archive from raw bytes.
+    pub fn parse(data: &[u8]) -> Result<Self, ArError> {
+        if data.len() < MAGIC.len() {
+            return Err(ArError::Truncated);
+        }
+        if &data[..MAGIC.len()] != MAGIC {
+            return Err(ArError::BadMagic);
         }
         let mut members = Vec::new();
-        let mut pos = 8usize;
-        let mut name_table: Vec<u8> = Vec::new();
-        while pos + HEADER_LEN <= data.len() {
-            let hdr = &data[pos..pos + HEADER_LEN];
+        let mut string_table: Vec<u8> = Vec::new();
+        let mut pos = MAGIC.len();
+
+        while pos + HDR_LEN <= data.len() {
+            let hdr = &data[pos..pos + HDR_LEN];
             if &hdr[58..60] != b"`\n" {
-                return Err(BinutilsError::Malformed("bad member magic"));
+                break; // not a valid member header — end of archive
             }
-            let raw_name = std::str::from_utf8(&hdr[0..16])
-                .map_err(|_| BinutilsError::Malformed("bad member name"))?
-                .trim()
-                .trim_end_matches('/');
-            let size: u64 = std::str::from_utf8(&hdr[48..58])
-                .map_err(|_| BinutilsError::Malformed("bad member size"))?
-                .trim()
-                .parse()
-                .map_err(|_| BinutilsError::Malformed("bad member size"))?;
-            pos += HEADER_LEN;
-            let end = pos + size as usize;
-            if end > data.len() {
-                return Err(BinutilsError::Malformed("member overruns archive"));
+            let name_raw = std::str::from_utf8(&hdr[0..16]).unwrap_or("").to_string();
+            let size = parse_num(&hdr[48..58], "size")?;
+            let data_start = pos + HDR_LEN;
+            let data_end = data_start.saturating_add(size);
+            if data_end > data.len() {
+                return Err(ArError::Truncated);
             }
-            let body = &data[pos..end];
-            let name = if raw_name == GLOBAL_NAME.trim_end_matches('/') {
-                // "//" — name table
-                name_table = body.to_vec();
-                pos = end + (end & 1); // members are 2-byte aligned
-                continue;
-            } else if raw_name.starts_with('/') && raw_name.len() > 1
-                && raw_name[1..].chars().all(|c| c.is_ascii_digit())
-            {
-                // "/<offset>" — long name reference (trailing '/' trimmed above)
-                let off: usize = raw_name[1..]
-                    .parse()
-                    .map_err(|_| BinutilsError::Malformed("bad long-name offset"))?;
-                let rel_end = name_table[off..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map(|i| off + i)
-                    .ok_or(BinutilsError::Malformed("unterminated long name"))?;
-                String::from_utf8_lossy(&name_table[off..rel_end])
-                    .trim_end_matches('/')
-                    .to_string()
-            } else if raw_name == "/" || raw_name.starts_with("/SYM") {
-                pos = end + (end & 1);
-                continue; // symbol table — skipped by this tool
-            } else {
-                raw_name.to_string()
-            };
-            members.push(Member {
-                name,
-                kind: MemberKind::Object,
-                data: body.to_vec(),
-            });
-            pos = end + (end & 1);
+            let member_data = &data[data_start..data_end];
+
+            // Long-name data head for BSD "#1/" names is inside member_data.
+            let name = resolve_name(&name_raw, &string_table, member_data)?;
+
+            // String table member: "/" or "//" stores long names for later members.
+            if name_raw.trim_end().starts_with("//") {
+                string_table = member_data.to_vec();
+            } else if !name.is_empty() {
+                members.push(Member { name, data: member_data.to_vec() });
+            }
+
+            // Members are padded to an even boundary.
+            pos = data_end + (size & 1);
         }
-        Ok(Self { members })
+
+        Ok(Self { members, string_table })
     }
 
-    /// Find a member by name.
-    pub fn member(&self, name: &str) -> Result<&Member, BinutilsError> {
+    /// Look up a member by exact name.
+    pub fn member(&self, name: &str) -> Result<&Member, ArError> {
         self.members
             .iter()
             .find(|m| m.name == name)
-            .ok_or_else(|| BinutilsError::NotFound(name.to_string()))
-    }
-}
-
-fn write_header(out: &mut Vec<u8>, name: &str, size: u64, mode: u32) {
-    out.extend_from_slice(format!("{name:<16}").as_bytes());
-    out.extend_from_slice(b"0           "); // mtime
-    out.extend_from_slice(b"0     0     "); // uid gid
-    out.extend_from_slice(format!("{mode:<8o}").as_bytes());
-    out.extend_from_slice(format!("{size:<10}").as_bytes());
-    out.extend_from_slice(b"`\n");
-}
-
-fn pad(out: &mut Vec<u8>) {
-    if out.len() % 2 == 1 {
-        out.push(b'\n');
+            .ok_or_else(|| ArError::MemberNotFound(name.to_string()))
     }
 }
 
@@ -178,29 +143,50 @@ fn pad(out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_and_parse_roundtrip() {
-        let mut b = ArchiveBuilder::new();
-        b.add("foo.o", vec![1, 2, 3]).add("bar.o", vec![4, 5]);
-        let bytes = b.build();
-        assert_eq!(&bytes[..8], MAGIC);
-        let a = Archive::parse(&bytes).unwrap();
-        assert_eq!(a.members.len(), 2);
-        assert_eq!(a.member("foo.o").unwrap().data, vec![1, 2, 3]);
+    fn ar_member(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut n = name.as_bytes().to_vec();
+        n.resize(16, b' ');
+        v.extend_from_slice(&n);
+        v.extend_from_slice(b"0           0     0     100644  ");
+        let sz = format!("{:>10}", body.len());
+        v.extend_from_slice(sz.as_bytes());
+        v.extend_from_slice(b"`\n");
+        v.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            v.push(b'\n');
+        }
+        v
     }
 
     #[test]
-    fn long_names_use_name_table() {
-        let mut b = ArchiveBuilder::new();
-        b.add("a-very-long-object-name.o", vec![9]);
-        let bytes = b.build();
-        assert!(bytes.windows(2).any(|w| w == b"//"));
-        let a = Archive::parse(&bytes).unwrap();
-        assert_eq!(a.members[0].name, "a-very-long-object-name.o");
+    fn parses_simple_archive() {
+        let mut data = MAGIC.to_vec();
+        data.extend(ar_member("foo.o/", b"OBJECT-A"));
+        data.extend(ar_member("bar.o/", b"OBJECT-BB"));
+        let a = Archive::parse(&data).unwrap();
+        assert_eq!(a.members.len(), 2);
+        assert_eq!(a.members[0].name, "foo.o");
+        assert_eq!(a.members[0].data, b"OBJECT-A");
+        assert_eq!(a.members[1].name, "bar.o");
+    }
+
+    #[test]
+    fn member_lookup() {
+        let mut data = MAGIC.to_vec();
+        data.extend(ar_member("x.o/", b"X"));
+        let a = Archive::parse(&data).unwrap();
+        assert!(a.member("x.o").is_ok());
+        assert!(a.member("nope.o").is_err());
     }
 
     #[test]
     fn rejects_bad_magic() {
-        assert!(Archive::parse(b"nope").is_err());
+        assert!(matches!(Archive::parse(b"not an archive"), Err(ArError::BadMagic)));
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        assert!(matches!(Archive::parse(b"!<arch>"), Err(ArError::Truncated)));
     }
 }

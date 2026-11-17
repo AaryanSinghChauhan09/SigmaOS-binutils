@@ -1,4 +1,4 @@
-use binutils::{ar::Archive, elf::ElfFile};
+use sigmaos_binutils::{ar::Archive, elf::ElfFile};
 use std::env;
 use std::fs;
 use std::process::ExitCode;

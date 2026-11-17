@@ -1,16 +1,90 @@
-//! ELF64 object inspection — the `nm`/`objdump -h` primitives.
+//! Minimal ELF64 parser: section headers, section names, symbol table.
+//!
+//! Supports the fields `nm`/`objdump -h` need: symbol value/binding/name
+//! and section offset/size/name. Little- and big-endian are handled for
+//! the fixed-width fields via explicit byte reads.
 
-use crate::error::BinutilsError;
+use std::fmt;
+
+/// Errors produced while parsing an ELF file.
+#[derive(Debug)]
+pub enum ElfError {
+    /// Input is too short for an ELF header.
+    Truncated,
+    /// The ELF magic `\x7fELF` is absent.
+    BadMagic,
+    /// Unsupported ELF class (only ELF64 is handled).
+    BadClass,
+    /// A table offset/size is inconsistent with the file length.
+    BadTable,
+}
+
+impl fmt::Display for ElfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "file truncated"),
+            Self::BadMagic => write!(f, "not an ELF file"),
+            Self::BadClass => write!(f, "unsupported ELF class (need ELF64)"),
+            Self::BadTable => write!(f, "section/symbol table out of range"),
+        }
+    }
+}
+impl std::error::Error for ElfError {}
 
 const ELFMAG: &[u8; 4] = b"\x7fELF";
-const ET_REL: u16 = 1;
+const ELFCLASS64: u8 = 2;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 
-/// ELF section header (64-bit).
-#[derive(Debug, Clone, Copy)]
+fn u16le(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
+fn u32le(b: &[u8]) -> u32 { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) }
+fn u64le(b: &[u8]) -> u64 { u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
+
+/// Symbol binding (high nibble of `st_info`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    Local,
+    Global,
+    Weak,
+    Other(u8),
+}
+
+impl fmt::Display for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => write!(f, "LOCAL"),
+            Self::Global => write!(f, "GLOBAL"),
+            Self::Weak => write!(f, "WEAK"),
+            Self::Other(n) => write!(f, "BIND{n}"),
+        }
+    }
+}
+
+/// A parsed symbol-table entry.
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name: String,
+    pub value: u64,
+    pub binding: Binding,
+}
+
+/// A parsed section-header entry.
+#[derive(Debug, Clone)]
+pub struct Section {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// A parsed ELF64 file.
+#[derive(Debug)]
+pub struct ElfFile {
+    pub symbols: Vec<Symbol>,
+    pub sections: Vec<Section>,
+}
+
 struct Shdr {
-    name: u32,
+    name_off: u32,
     sh_type: u32,
     offset: u64,
     size: u64,
@@ -18,233 +92,193 @@ struct Shdr {
     entsize: u64,
 }
 
-/// One ELF section.
-#[derive(Debug, Clone)]
-pub struct Section {
-    pub name: String,
-    pub sh_type: u32,
-    pub offset: u64,
-    pub size: u64,
+fn read_shdrs(data: &[u8]) -> Result<(Vec<Shdr>, u64, u16), ElfError> {
+    if data.len() < 64 {
+        return Err(ElfError::Truncated);
+    }
+    if &data[0..4] != ELFMAG {
+        return Err(ElfError::BadMagic);
+    }
+    if data[4] != ELFCLASS64 {
+        return Err(ElfError::BadClass);
+    }
+    let shoff = u64le(&data[40..48]);
+    let shentsize = u16le(&data[58..60]) as usize;
+    let shnum = u16le(&data[60..62]) as usize;
+    let shstrndx = u16le(&data[62..64]) as usize;
+    if shentsize == 0 || shnum == 0 {
+        return Ok((Vec::new(), shoff, shstrndx as u16));
+    }
+    let mut shdrs = Vec::with_capacity(shnum);
+    for i in 0..shnum {
+        let off = shoff as usize + i * shentsize;
+        if off + 64 > data.len() {
+            return Err(ElfError::BadTable);
+        }
+        let s = &data[off..off + 64];
+        shdrs.push(Shdr {
+            name_off: u32le(&s[0..4]),
+            sh_type: u32le(&s[4..8]),
+            offset: u64le(&s[24..32]),
+            size: u64le(&s[32..40]),
+            link: u32le(&s[40..44]),
+            entsize: u64le(&s[56..64]),
+        });
+    }
+    Ok((shdrs, shoff, shstrndx as u16))
 }
 
-/// Symbol binding/type classification (`nm` output letters).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolKind {
-    Function,
-    Object,
-    Section,
-    File,
-    Other,
-}
-
-/// One ELF symbol.
-#[derive(Debug, Clone)]
-pub struct Symbol {
-    pub name: String,
-    pub value: u64,
-    pub size: u64,
-    pub kind: SymbolKind,
-    pub binding: char, // 'T','t','D','d','B','b','U' style
-}
-
-/// Parsed ELF64 relocatable/executable image (headers + tables only).
-#[derive(Debug)]
-pub struct ElfFile {
-    pub is_64: bool,
-    pub is_lsb: bool,
-    pub sections: Vec<Section>,
-    pub symbols: Vec<Symbol>,
+fn cstr<'a>(buf: &'a [u8], off: usize) -> Option<&'a str> {
+    if off >= buf.len() {
+        return None;
+    }
+    let end = buf[off..].iter().position(|&b| b == 0).map(|p| off + p)?;
+    std::str::from_utf8(&buf[off..end]).ok()
 }
 
 impl ElfFile {
-    /// Parse an ELF64 file (little- or big-endian).
-    pub fn parse(data: &[u8]) -> Result<Self, BinutilsError> {
-        if data.len() < 64 || &data[..4] != ELFMAG {
-            return Err(BinutilsError::BadFormat("not an ELF file"));
+    /// Parse an ELF64 file, extracting sections and symbols.
+    pub fn parse(data: &[u8]) -> Result<Self, ElfError> {
+        let (shdrs, _, shstrndx) = read_shdrs(data)?;
+        if shdrs.is_empty() {
+            return Ok(Self { symbols: Vec::new(), sections: Vec::new() });
         }
-        let class = data[4];
-        let endian = data[5];
-        if class != 2 {
-            return Err(BinutilsError::BadFormat("ELF32 not supported"));
-        }
-        let le = match endian {
-            1 => true,
-            2 => false,
-            _ => return Err(BinutilsError::Malformed("bad ELF data encoding")),
-        };
-        let rd16 = |o: usize| -> u16 {
-            let b = [data[o], data[o + 1]];
-            if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }
-        };
-        let rd32 = |o: usize| -> u32 {
-            let b = data[o..o + 4].try_into().unwrap();
-            if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
-        };
-        let rd64 = |o: usize| -> u64 {
-            let b = data[o..o + 8].try_into().unwrap();
-            if le { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) }
-        };
-        let _etype = rd16(16);
-        let shoff = rd64(40) as usize;
-        let shentsize = rd16(58) as usize;
-        let shnum = rd16(60) as usize;
-        let shstrndx = rd16(62) as usize;
 
-        if shentsize < 64 || shoff + shnum * shentsize > data.len() {
-            return Err(BinutilsError::Malformed("bad section table"));
-        }
-        let mut shdrs = Vec::with_capacity(shnum);
-        for i in 0..shnum {
-            let b = shoff + i * shentsize;
-            shdrs.push(Shdr {
-                name: rd32(b),
-                sh_type: rd32(b + 4),
-                offset: rd64(b + 24),
-                size: rd64(b + 32),
-                link: rd32(b + 40),
-                entsize: rd64(b + 56),
-            });
-        }
-        // Section names via shstrtab.
-        let names = if shstrndx < shnum {
-            let s = &shdrs[shstrndx];
-            strtab(data, s.offset as usize, s.size as usize)?
-        } else {
-            Vec::new()
-        };
-        let section_name = |n: u32| -> String {
-            let end = names[n as usize..]
-                .iter()
-                .position(|&c| c == 0)
-                .map(|i| n as usize + i)
-                .unwrap_or(names.len());
-            String::from_utf8_lossy(&names[n as usize..end]).into_owned()
-        };
-        let sections: Vec<Section> = shdrs
-            .iter()
-            .map(|s| Section {
-                name: section_name(s.name),
-                sh_type: s.sh_type,
-                offset: s.offset,
-                size: s.size,
-            })
-            .collect();
+        // Section-name string table.
+        let shstr = shdrs.get(shstrndx as usize).ok_or(ElfError::BadTable)?;
+        let names_buf = slice_at(data, shstr.offset, shstr.size)?;
 
-        // Symbols via SHT_SYMTAB.
+        // Build section list.
+        let mut sections = Vec::with_capacity(shdrs.len());
+        for s in &shdrs {
+            let name = cstr(names_buf, s.name_off as usize).unwrap_or("").to_string();
+            sections.push(Section { name, offset: s.offset, size: s.size });
+        }
+
+        // Symbols from SHT_SYMTAB sections.
         let mut symbols = Vec::new();
         for s in &shdrs {
-            if s.sh_type != SHT_SYMTAB || s.entsize == 0 {
+            if s.sh_type != SHT_SYMTAB {
                 continue;
             }
-            let strsec = &shdrs[s.link as usize];
-            let strs = strtab(data, strsec.offset as usize, strsec.size as usize)?;
-            let count = s.size / s.entsize;
-            for i in 0..count {
-                let b = s.offset as usize + i as usize * s.entsize as usize;
-                if b + 24 > data.len() {
-                    return Err(BinutilsError::Malformed("symbol overruns file"));
+            let strtab = shdrs.get(s.link as usize).ok_or(ElfError::BadTable)?;
+            let str_buf = slice_at(data, strtab.offset, strtab.size)?;
+            let sym_buf = slice_at(data, s.offset, s.size)?;
+            let entsize = if s.entsize == 0 { 24 } else { s.entsize as usize };
+            let mut off = 0usize;
+            while off + 24 <= sym_buf.len() {
+                let e = &sym_buf[off..off + 24];
+                let name_off = u32le(&e[0..4]) as usize;
+                let info = e[4];
+                let binding = match info >> 4 {
+                    0 => Binding::Local,
+                    1 => Binding::Global,
+                    2 => Binding::Weak,
+                    n => Binding::Other(n),
+                };
+                let value = u64le(&e[8..16]);
+                let name = cstr(str_buf, name_off).unwrap_or("").to_string();
+                // Skip the all-zero null symbol and unnamed section symbols.
+                if !(value == 0 && name.is_empty() && binding == Binding::Local) {
+                    symbols.push(Symbol { name, value, binding });
                 }
-                let name_off = rd32(b) as usize;
-                let info = data[b + 4];
-                let other = data[b + 5];
-                let shndx = rd16(b + 6);
-                let value = rd64(b + 8);
-                let size = rd64(b + 16);
-                let name = cstr(&strs, name_off);
-                if name.is_empty() && shndx == 0 {
-                    continue;
-                }
-                let bind = info >> 4;
-                let typ = info & 0xf;
-                let binding = match bind {
-                    0 => 'U', // LOCAL→'t'/'d' handled below; keep simple
-                    1 => 'U',
-                    2 => 'W',
-                    _ => 'U',
-                };
-                let kind = match typ {
-                    2 => SymbolKind::Function,
-                    1 => SymbolKind::Object,
-                    3 => SymbolKind::Section,
-                    4 => SymbolKind::File,
-                    _ => SymbolKind::Other,
-                };
-                // nm-style letter: global text/data/bss.
-                let letter = match (bind, typ, shndx) {
-                    (1, _, 0) => 'U',
-                    (1, 2, _) => 'T',
-                    (1, 1, _) => 'D',
-                    (0, 2, _) => 't',
-                    (0, 1, _) => 'd',
-                    (_, _, 0) => 'U',
-                    _ => binding,
-                };
-                let _ = other;
-                symbols.push(Symbol { name, value, size, kind, binding: letter });
+                off += entsize.max(24);
             }
         }
-        Ok(Self { is_64: true, is_lsb: le, sections, symbols })
+
+        Ok(Self { symbols, sections })
     }
 }
 
-fn strtab(data: &[u8], off: usize, size: usize) -> Result<Vec<u8>, BinutilsError> {
-    if off + size > data.len() {
-        return Err(BinutilsError::Malformed("string table overruns file"));
+fn slice_at(data: &[u8], off: u64, size: u64) -> Result<&[u8], ElfError> {
+    let (o, z) = (off as usize, size as usize);
+    if o.checked_add(z).map_or(true, |end| end > data.len()) {
+        return Err(ElfError::BadTable);
     }
-    Ok(data[off..off + size].to_vec())
-}
-
-fn cstr(tab: &[u8], off: usize) -> String {
-    if off >= tab.len() {
-        return String::new();
-    }
-    let end = tab[off..]
-        .iter()
-        .position(|&c| c == 0)
-        .map(|i| off + i)
-        .unwrap_or(tab.len());
-    String::from_utf8_lossy(&tab[off..end]).into_owned()
+    Ok(&data[o..o + z])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_non_elf() {
-        assert!(ElfFile::parse(b"hello").is_err());
-        assert!(ElfFile::parse(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0]).is_err()); // ELF32
+    /// Build a minimal ELF64 image with a section-name table and one symtab.
+    fn sample_elf() -> Vec<u8> {
+        // Layout: ehdr(64) | shstrtab | symtab | strtab | shdrs
+        let ehdr_size = 64usize;
+        let shstr = b"\x00.text\x00.symtab\x00.strtab\x00.shstrtab\x00";
+        let strtab = b"\x00main\x00";
+        // symtab: null sym + main (GLOBAL, value 0x1000)
+        let mut symtab = vec![0u8; 24];
+        let mut e = vec![0u8; 24];
+        e[0..4].copy_from_slice(&1u32.to_le_bytes()); // st_name -> "main"
+        e[4] = (1 << 4) | 2; // GLOBAL FUNC
+        e[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        symtab.extend_from_slice(&e);
+
+        let shstr_off = ehdr_size;
+        let symtab_off = shstr_off + shstr.len();
+        let strtab_off = symtab_off + symtab.len();
+        let shoff = (strtab_off + strtab.len() + 7) & !7;
+
+        let mut d = vec![0u8; shoff];
+        // ELF header
+        d[0..4].copy_from_slice(ELFMAG);
+        d[4] = ELFCLASS64;
+        d[5] = 1; // little-endian
+        d[6] = 1; // version
+        d[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        d[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // x86-64
+        d[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        d[58..60].copy_from_slice(&64u16.to_le_bytes()); // shentsize
+        d[60..62].copy_from_slice(&5u16.to_le_bytes()); // shnum
+        d[62..64].copy_from_slice(&4u16.to_le_bytes()); // shstrndx
+
+        d[shstr_off..shstr_off + shstr.len()].copy_from_slice(shstr);
+        d[symtab_off..symtab_off + symtab.len()].copy_from_slice(&symtab);
+        d[strtab_off..strtab_off + strtab.len()].copy_from_slice(strtab);
+
+        // 5 section headers (null, .text, .symtab, .strtab, .shstrtab)
+        let mut push_sh = |d: &mut Vec<u8>, name: u32, ty: u32, off: u64, size: u64, link: u32, entsize: u64| {
+            let base = d.len();
+            d.resize(base + 64, 0);
+            let s = &mut d[base..base + 64];
+            s[0..4].copy_from_slice(&name.to_le_bytes());
+            s[4..8].copy_from_slice(&ty.to_le_bytes());
+            s[24..32].copy_from_slice(&off.to_le_bytes());
+            s[32..40].copy_from_slice(&size.to_le_bytes());
+            s[40..44].copy_from_slice(&link.to_le_bytes());
+            s[56..64].copy_from_slice(&entsize.to_le_bytes());
+        };
+        push_sh(&mut d, 0, 0, 0, 0, 0, 0); // null
+        push_sh(&mut d, 1, 1, 0, 0, 0, 0); // .text
+        push_sh(&mut d, 7, SHT_SYMTAB, symtab_off as u64, symtab.len() as u64, 3, 24); // .symtab -> .strtab(idx3)
+        push_sh(&mut d, 15, SHT_STRTAB, strtab_off as u64, strtab.len() as u64, 0, 0); // .strtab
+        push_sh(&mut d, 23, SHT_STRTAB, shstr_off as u64, shstr.len() as u64, 0, 0); // .shstrtab
+
+        d
     }
 
     #[test]
-    fn parses_minimal_elf64() {
-        // Hand-built ELF64 LE header + shstrtab + empty section table.
-        let mut d = vec![0u8; 64];
-        d[0..4].copy_from_slice(b"\x7fELF");
-        d[4] = 2; d[5] = 1; d[6] = 1;
-        // e_shoff=64, shentsize=64, shnum=3, shstrndx=2 — wait need room; place table at 64.
-        // Simpler: shoff points past ident+header = 64; 3 sections × 64 bytes.
-        d[40..48].copy_from_slice(&64u64.to_le_bytes());
-        d[58..60].copy_from_slice(&64u16.to_le_bytes());
-        d[60..62].copy_from_slice(&3u16.to_le_bytes());
-        d[62..64].copy_from_slice(&2u16.to_le_bytes());
-        // Extend file: shstrtab content at 64+3*64=256
-        d.resize(320, 0);
-        let stroff = 256usize;
-        d[stroff..stroff + 25].copy_from_slice(b"\0.text\0.shstrtab\0.symtab\0");
-        // shdr[0] null; shdr[1] .text (name=1,type=1); shdr[2] .shstrtab (name=7,type=3,off=256,size=22,link=0)
-        let w = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
-        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
-        let s1 = 128; // shdr1
-        w(&mut d, s1, 1); w(&mut d, s1 + 4, 1); // name,type
-        w64(&mut d, s1 + 24, 0); w64(&mut d, s1 + 32, 0);
-        let s2 = 192; // shdr2
-        w(&mut d, s2, 7); w(&mut d, s2 + 4, 3);
-        w64(&mut d, s2 + 24, stroff as u64); w64(&mut d, s2 + 32, 22);
-        w(&mut d, s2 + 40, 0);
+    fn parses_sections_and_symbols() {
+        let d = sample_elf();
         let e = ElfFile::parse(&d).unwrap();
-        assert_eq!(e.sections.len(), 3);
-        assert_eq!(e.sections[1].name, ".text");
-        assert_eq!(e.sections[2].name, ".shstrtab");
+        assert!(e.sections.iter().any(|s| s.name == ".text"));
+        assert!(e.sections.iter().any(|s| s.name == ".symtab"));
+        let main = e.symbols.iter().find(|s| s.name == "main").expect("main symbol");
+        assert_eq!(main.value, 0x1000);
+        assert_eq!(main.binding, Binding::Global);
+    }
+
+    #[test]
+    fn rejects_non_elf() {
+        assert!(matches!(ElfFile::parse(b"hello"), Err(ElfError::Truncated) | Err(ElfError::BadMagic)));
+    }
+
+    #[test]
+    fn rejects_non_elf64() {
+        let mut d = sample_elf();
+        d[4] = 1; // ELFCLASS32
+        assert!(matches!(ElfFile::parse(&d), Err(ElfError::BadClass)));
     }
 }

@@ -7,6 +7,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ar;
+pub mod elf;
+
+pub use ar::{Archive, ArError, Member};
+pub use elf::{Binding, ElfError, ElfFile, Section, Symbol};
+
+
+
 use std::fmt;
 /// Errors for `ToolError` operations. Fail-fast: invalid input is rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
